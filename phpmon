@@ -3,7 +3,7 @@
 
 /**
  * Hyperf Watch Hot Reload Scripts, Also support other scripts.
- * From: https://github.com/hectorqin/hyperf-watch
+ * From: https://github.com/hectorqin/phpmon
  * Author: hectorqin@163.com
  * Fork & Modify From: https://github.com/ha-ni-cc/hyperf-watch
  */
