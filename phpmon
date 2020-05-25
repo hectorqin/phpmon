@@ -1,0 +1,438 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * Hyperf Watch Hot Reload Scripts, Also support other scripts.
+ * From: https://github.com/hectorqin/hyperf-watch
+ * Author: hectorqin@163.com
+ * Fork & Modify From: https://github.com/ha-ni-cc/hyperf-watch
+ */
+use Swoole\Event;
+use Swoole\Process;
+use Swoole\Timer;
+
+/**
+ * 监控文件过滤器
+ */
+class Filter extends RecursiveFilterIterator
+{
+    public function accept()
+    {
+        global $config;
+        if ($this->current()->isDir()) {
+            if (preg_match('/^\./', $this->current()->getFilename())) {
+                return false;
+            }
+            return !in_array($this->current()->getFilename(), $config['EXCLUDE_DIR']);
+        }
+        $list = array_map(function (string $item): string {
+            return "\.$item";
+        }, explode(',', $config['WATCH_EXT']));
+        $list = implode('|', $list);
+        return preg_match("/($list)$/", $this->current()->getFilename());
+    }
+}
+
+/**
+ * 关闭旧进程
+ * @return void
+ */
+function killOldProcess()
+{
+    global $config;
+    $pidFilePath = $config['PID_FILE_PATH'];
+    // pid存在则关闭存在的进程
+    if (file_exists($pidFilePath) && $pid = @file_get_contents($pidFilePath)) {
+        echo "Kill master process with pid($pid) that read from $pidFilePath" . PHP_EOL;
+        if (!posix_kill($pid, SIGKILL)) {
+            if ($config['KILL_MATCH_PARTERN']) {
+                forceKill($config['KILL_MATCH_PARTERN']);
+            }
+        }
+    }
+}
+
+/**
+ * 杀死程序
+ * @param string $match
+ * @return void
+ */
+function forceKill($match)
+{
+    if (!$match || $match == '--') {
+        return;
+    }
+
+    echo "Force kill processes that match $match" . PHP_EOL;
+
+    global $argv;
+    $self = $argv[0];
+    exec("ps -ef | grep '$match' | grep -v grep | grep -v '$self' | awk '{print $2}'| xargs kill -9 2>&1");
+}
+
+/**
+ * 打印swoole错误
+ * @return void
+ */
+function swooleError()
+{
+    if (function_exists('swoole_strerror') && function_exists('swoole_errno')) {
+        echo swoole_strerror(swoole_errno()) . PHP_EOL;
+    } else {
+        echo 'Failed to start swoole Process' . PHP_EOL;
+    }
+    exit(1);
+}
+
+/**
+ * 监控STDIN输入
+ * @return void
+ */
+function watchStdin()
+{
+    echo "Start watch STDIN" . PHP_EOL;
+    // 监控 STDIN
+    $stdinWatcher = new Process(function (Process $process) {
+        while (true) {
+            $input = '';
+            fscanf(STDIN, "%s" . PHP_EOL, $input);
+            echo "Read STDIN input " . $input . PHP_EOL;
+            if (strtolower(trim($input)) == 'rs') {
+                $process->write('restart');
+            }
+        }
+    });
+    $stdinWatcher->start();
+    Event::add($stdinWatcher->pipe, function ($pipe) use (&$stdinWatcher) {
+        $message = @$stdinWatcher->read();
+        if ($message == 'restart') {
+            echo "Restarting..." . PHP_EOL . PHP_EOL;
+            restart();
+        }
+    });
+
+    if (false === $stdinWatcher->pid) {
+        swooleError();
+    }
+}
+
+/**
+ * 启动程序
+ * @return void
+ */
+function start()
+{
+    // 杀旧进程
+    killOldProcess();
+    global $serve, $config;
+    $serve = new Process(function (Process $process) use ($config) {
+        if ($config['CLEAR']) {
+            delDir('./runtime/container');
+        }
+        echo "Exec " . BIN_FILE . " '" . implode("' '", $config['START_COMMAND']) . "'" . PHP_EOL;
+        $process->exec(BIN_FILE, $config['START_COMMAND']);
+    }, true);
+    $serve->start();
+    if (false === $serve->pid) {
+        swooleError();
+    }
+    Event::add($serve->pipe, function ($pipe) use (&$serve) {
+        $message = @$serve->read();
+        if (!empty($message)) {
+            echo $message;
+        }
+    });
+}
+
+/**
+ * 监控文件
+ * @return void
+ */
+function watch()
+{
+    global $hashes, $config;
+    foreach ($hashes as $pathName => $currentHash) {
+        if (!file_exists($pathName)) {
+            unset($hashes[$pathName]);
+            continue;
+        }
+        $newHash = fileHash($pathName);
+        if ($newHash != $currentHash) {
+            if ($config['VERBOSE']) {
+                echo "File changed: " . $pathName . PHP_EOL;
+            }
+            $hashes[$pathName] = $newHash;
+            needRestart();
+            break;
+        }
+    }
+}
+
+/**
+ * 刷新监控文件
+ * @return void
+ */
+function state()
+{
+    global $config, $hashes;
+    $files  = array_merge(...array_map('phpFiles', $config['WATCH_DIR']));
+    $hashes = array_combine($files, array_map('fileHash', $files));
+    $count  = count($hashes);
+    echo "📡 Watching $count files..." . PHP_EOL;
+    if ($config['VERBOSE']) {
+        echo "    Files\tHash" . PHP_EOL;
+        foreach ($hashes as $pathName => $currentHash) {
+            echo "    " . $pathName . "\t" . $currentHash . PHP_EOL;
+        }
+        echo PHP_EOL;
+    }
+}
+
+/**
+ * 延迟重启
+ * @return void
+ */
+function needRestart()
+{
+    global $config, $restartTimer;
+    if (!$config['RESTART_DELAY']) {
+        restart();
+        return;
+    }
+    if ($restartTimer) {
+        Timer::clear($restartTimer);
+    }
+    echo "Will restart after " . $config['RESTART_DELAY'] * 1000 . "ms" . PHP_EOL;
+    $restartTimer = Timer::after($config['RESTART_DELAY'] * 1000, 'restart');
+}
+
+/**
+ * 重启
+ * @return void
+ */
+function restart()
+{
+    global $serve;
+    echo "🔄 Restart @ " . date('Y-m-d H:i:s') . PHP_EOL;
+    Process::kill($serve->pid);
+    Process::wait();
+    start();
+    state();
+}
+
+/**
+ * 获取文件md5
+ * @param string $pathname
+ * @return string
+ */
+function fileHash(string $pathname): string
+{
+    $contents = file_get_contents($pathname);
+    if (false === $contents) {
+        return 'deleted';
+    }
+    return md5($contents);
+}
+
+/**
+ * 获取监控文件列表
+ * @param string $dirname
+ * @return array
+ */
+function phpFiles(string $dirname): array
+{
+    $directory = new RecursiveDirectoryIterator($dirname);
+    $filter    = new Filter($directory);
+    $iterator  = new RecursiveIteratorIterator($filter);
+    return array_map(function ($fileInfo) {
+        return $fileInfo->getPathname();
+    }, iterator_to_array($iterator));
+}
+
+/**
+ * 删除目录
+ * @param mixed $path
+ * @return void
+ */
+function delDir($path)
+{
+    if (is_dir($path)) {
+        //扫描一个目录内的所有目录和文件并返回数组
+        $dirs = scandir($path);
+        foreach ($dirs as $dir) {
+            //排除目录中的当前目录(.)和上一级目录(..)
+            if ($dir != '.' && $dir != '..') {
+                //如果是目录则递归子目录，继续操作
+                $sonDir = $path . '/' . $dir;
+                if (is_dir($sonDir)) {
+                    //递归删除
+                    delDir($sonDir);
+                    //目录内的子目录和文件删除后删除空目录
+                    @rmdir($sonDir);
+                } else {
+                    //如果是文件直接删除
+                    @unlink($sonDir);
+                }
+            }
+        }
+        @rmdir($path);
+    }
+}
+
+/**
+ * 打印帮助信息
+ * @return void
+ */
+function printUsage()
+{
+    global $argv;
+    $script = $argv[0];
+    echo <<<EOF
+Usage: php $script [options]
+
+Options:
+-n, --nohyperf  ........... not start hyperf server, then pid file and watch
+                            extensions are empty.
+-w, --watch=dir ........... watch directory "dir" or files. use once for
+                            each directory or file to watch.
+-d, --delay=second ........ restart delay seconds after file changed.
+-e, --ext=extension ....... extensions to look for, ie. php,env.
+-b, --bin=path ............ executable script or binary file.
+-i, --ignore=path ......... ignore specific files or directories, default
+                            is ["vendor"].
+-s, --script=file ......... script file, default is "./bin/hyperf.php".
+-p, --pid=file ............ pid file, will be used to kill master process,
+                            default is "./runtime/hyperf.pid".
+-k  --kill=match .......... force kill processes that match this partern
+                            before start.
+-c  --clear ............... for hyperf only, to delete runtime/container
+                            folder before start, default false.
+
+-V, --verbose ............. show detail on what is causing restarts.
+-h  --help ................ print usage.
+
+-- <your args> ............ to tell $script stop slurping arguments, and
+                            pass the left args to your binary. Default
+                            is ["script file", "start"]
+
+Examples:
+
+- Exec php ./bin/hyperf start, watch current folder
+php $script
+
+- Exec php ./bin/hyperf start, watch current folder, and use the specified PHP
+php $script -b /usr/local/bin/php
+
+- Exec php ./bin/hyperf start, watch app,config folders
+php $script -w app --watch config
+
+- Exec php ./bin/hyperf start, watch app,config folders, and restart delay
+    3 seconds after file change.
+php $script -w app --watch config -d 3
+
+- Exec php ./bin/hyperf start, watch app,config folders, and restart delay
+    3 seconds after file change, and remove runtime/container folder.
+php $script -w app --watch config -d 3 -c
+
+- Exec php ./bin/hyperf start, watch app,config folders, and restart delay
+    3 seconds after file change, and remove runtime/container folder, and set the entry script.
+php $script -w app --watch config -d 3 -c -s hyperf
+
+- Exec php ./bin/hyperf start, watch app,config folders, and restart delay
+    3 seconds after file change, and remove runtime/container folder, and set the entry script,
+    and ignore some file.
+php $script -w app --watch config -d 3 -c -s hyperf -i config/config.php --ignore config/routes.php
+
+- Exec other scripts
+php $script -n -b /usr/local/bin/node -- server.js
+php $script -n -b /usr/local/bin/python -- -m http.server 19980
+php $script -n -- -s 0.0.0.0:19980
+
+EOF;
+}
+
+/**
+ * 入口
+ * @return void
+ */
+function main()
+{
+    global $config, $argv;
+    $options = getopt("w:d:e:b:i:s:p:k:cmnvh", ['watch:', 'delay:', 'ext:', 'bin:', 'ignore:', 'script:', 'pid:', 'kill:', 'clear', 'manual', 'nohyperf', 'verbose', 'help']);
+
+    if (isset($options['h']) || isset($options['help'])) {
+        printUsage();
+        exit;
+    }
+
+    $defaultWatchDir = [
+        __DIR__ . '/',
+    ];
+    $startCommand = [];
+    foreach ($argv as $key => $arg) {
+        // 程序的参数
+        if ($arg == '--') {
+            $startCommand = array_slice($argv, ++$key);
+            break;
+        }
+    }
+    $isHyperf = !(isset($options['n']) ?: isset($options['nohyperf']) ?: false);
+    $entryPointFile = $options['s'] ?? $options['script'] ?? ($isHyperf ? './bin/hyperf.php' : '');
+    $config         = [
+        // BINARY File 程序所在路径（默认自动获取 PHP 程序路径）
+        'BINARY_FILE'        => $options['b'] ?? $options['bin'] ?? 'which php',
+        // Watch Dir 监听目录（默认监听脚本所在的根目录）
+        'WATCH_DIR'          => (array) (array_merge($options['w'] ?? [], $options['watch'] ?? []) ?: $defaultWatchDir),
+        // Watch Ext 监听扩展名（多个可用英文逗号隔开）
+        'WATCH_EXT'          => $options['e'] ?? $options['ext'] ?? ($isHyperf ? 'php,env' : ''),
+        // Exclude Dir 排除目录（不监听的目录，数组形式)
+        'EXCLUDE_DIR'        => (array) (array_merge($options['i'] ?? [], $options['ignore'] ?? []) ?: ['vendor']),
+        // Kill Match Partern 杀死进程的匹配字符串
+        'KILL_MATCH_PARTERN' => $options['k'] ?? $options['kill'] ?? '',
+        // Start Command 启动命令
+        'START_COMMAND'      => $startCommand ?: ($entryPointFile ? [$entryPointFile, 'start'] : ['start']),
+        // PID File Path PID文件路径
+        'PID_FILE_PATH'      => $options['p'] ?? $options['pid'] ?? ($isHyperf ? './runtime/hyperf.pid' : ''),
+        // Scan Interval 扫描间隔（毫秒，默认2000）
+        'SCAN_INTERVAL'      => 2000,
+        // Restart Delay 重启延迟
+        'RESTART_DELAY'      => $options['d'] ?? $options['delay'] ?? 0,
+        // Clear 是否清除 runtime
+        'CLEAR'              => isset($options['c']) ?: isset($options['clear']) ?: false,
+        // Verbose 显示变化文件
+        'VERBOSE'            => isset($options['v']) ?: isset($options['verbose']) ?: false,
+    ];
+
+    foreach ($config as $var => $default) {
+        $val          = getenv($var);
+        $config[$var] = $val === false ? $default : $val;
+    }
+
+    if (!function_exists('exec')) {
+        echo '[x] 请在php.ini配置中取消禁用exec方法' . PHP_EOL;
+        exit(1);
+    }
+
+    define('BIN_FILE', file_exists($config['BINARY_FILE']) ? $config['BINARY_FILE'] : @exec($config['BINARY_FILE']));
+
+    if (!file_exists(BIN_FILE) || !is_executable(BIN_FILE)) {
+        echo '[x] 可执行文件 (" ' . BIN_FILE . ' ") 路径没有找到或无法执行，请确认路径正确?' . PHP_EOL;
+        exit(1);
+    }
+
+    swoole_async_set(['enable_coroutine' => false, 'log_level' => SWOOLE_LOG_INFO]);
+
+    echo "🚀 Start @ " . date('Y-m-d H:i:s') . PHP_EOL;
+    watchStdin();
+    start();
+    state();
+    Timer::tick($config['SCAN_INTERVAL'], 'watch');
+}
+
+// 全局变量
+$hashes       = [];
+$serve        = null;
+$restartTimer = 0;
+$config       = [];
+
+main();
