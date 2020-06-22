@@ -214,6 +214,7 @@ function restart()
 {
     global $serve;
     echo "🔄 Restart @ " . date('Y-m-d H:i:s') . PHP_EOL;
+    Event::del($serve->pipe);
     Process::kill($serve->pid);
     Process::wait();
     start();
