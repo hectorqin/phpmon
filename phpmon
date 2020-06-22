@@ -377,7 +377,7 @@ function main()
             break;
         }
     }
-    $isHyperf = !(isset($options['n']) ?: isset($options['nohyperf']) ?: false);
+    $isHyperf = !(isset($options['n']) ?: (isset($options['nohyperf']) ?: false));
     $entryPointFile = $options['s'] ?? $options['script'] ?? ($isHyperf ? './bin/hyperf.php' : '');
     $config         = [
         // BINARY File 程序所在路径（默认自动获取 PHP 程序路径）
@@ -399,9 +399,9 @@ function main()
         // Restart Delay 重启延迟
         'RESTART_DELAY'      => $options['d'] ?? $options['delay'] ?? 0,
         // Clear 是否清除 runtime
-        'CLEAR'              => isset($options['c']) ?: isset($options['clear']) ?: false,
+        'CLEAR'              => isset($options['c']) ?: (isset($options['clear']) ?: false),
         // Verbose 显示变化文件
-        'VERBOSE'            => isset($options['v']) ?: isset($options['verbose']) ?: false,
+        'VERBOSE'            => isset($options['v']) ?: (isset($options['verbose']) ?: false),
     ];
 
     foreach ($config as $var => $default) {
