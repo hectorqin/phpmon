@@ -28,13 +28,15 @@ wget -O phpmon https://raw.githubusercontent.com/hectorqin/phpmon/master/phpmon
 
 ## Hyperf 使用说明
 
-### 启动监听
+### 启动监听 (Hyperf2.0不需要删除缓存)
+
+开发环境下搭配 [hectorqin/hyperf-fastloader](https://github.com/hectorqin/hyperf-fastloader) 使用，可加快Hyperf2.0重启速度.
 
 ```sh
 php phpmon
 ```
 
-### 启动监听并删除代理类缓存(./runtime/container)
+### 启动监听并删除代理类缓存(./runtime/container) (Hyperf1.* 需要删除缓存)
 
 ```sh
 php phpmon -c
